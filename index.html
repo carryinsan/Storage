@@ -1,0 +1,623 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithCustomToken, 
+  signInAnonymously, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  query, 
+  orderBy, 
+  onSnapshot, 
+  addDoc, 
+  deleteDoc, 
+  updateDoc, 
+  doc, 
+  serverTimestamp, 
+  getDocs,
+  getDoc,
+  limit
+} from 'firebase/firestore';
+import { 
+  FileText, Image as ImageIcon, Video, MoreHorizontal, 
+  Search, Plus, X, Trash2, Star, Share2, Download, 
+  Cloud, Grid, List, CheckCircle, AlertCircle, Loader2,
+  File, Smartphone, WifiOff, RefreshCw, PieChart,
+  Maximize2, ShieldCheck, Zap
+} from 'lucide-react';
+
+// --- Firebase Setup ---
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'vault-stream-ultimate';
+
+// --- Configuration ---
+const CHUNK_SIZE = 800 * 1024; // 800KB chunks (safe for Firestore)
+
+// --- IndexedDB Wrapper (For Resumable Uploads) ---
+// This allows us to store 30MB+ files in the browser cache temporarily
+const IDB = {
+  dbName: 'VaultStreamDB',
+  storeName: 'pending_uploads',
+  init: () => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(IDB.dbName, 1);
+      request.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(IDB.storeName)) {
+          db.createObjectStore(IDB.storeName, { keyPath: 'id' });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  },
+  save: async (fileData) => {
+    const db = await IDB.init();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB.storeName, 'readwrite');
+      tx.objectStore(IDB.storeName).put(fileData);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject();
+    });
+  },
+  get: async (id) => {
+    const db = await IDB.init();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB.storeName, 'readonly');
+      const req = tx.objectStore(IDB.storeName).get(id);
+      req.onsuccess = () => resolve(req.result);
+    });
+  },
+  getAll: async () => {
+    const db = await IDB.init();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB.storeName, 'readonly');
+      const req = tx.objectStore(IDB.storeName).getAll();
+      req.onsuccess = () => resolve(req.result);
+    });
+  },
+  delete: async (id) => {
+    const db = await IDB.init();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB.storeName, 'readwrite');
+      tx.objectStore(IDB.storeName).delete(id);
+      tx.oncomplete = () => resolve();
+    });
+  }
+};
+
+// --- Utilities ---
+const formatBytes = (bytes) => {
+  if (bytes === 0) return '0 B';
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return parseFloat((bytes / Math.pow(1024, i)).toFixed(1)) + ' ' + sizes[i];
+};
+
+// --- Components ---
+
+const Toast = ({ message, type, onClose }) => {
+  useEffect(() => {
+    const timer = setTimeout(onClose, 3000);
+    return () => clearTimeout(timer);
+  }, [onClose]);
+
+  return (
+    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[100] animate-slide-down">
+      <div className={`flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl backdrop-blur-md border border-white/10 ${
+        type === 'success' ? 'bg-green-500/20 text-green-200' : 
+        type === 'error' ? 'bg-red-500/20 text-red-200' : 'bg-gray-800/90 text-white'
+      }`}>
+        {type === 'success' ? <CheckCircle size={18} /> : 
+         type === 'error' ? <AlertCircle size={18} /> : <Zap size={18} />}
+        <span className="text-sm font-medium">{message}</span>
+      </div>
+    </div>
+  );
+};
+
+const StorageChart = ({ files }) => {
+  const totalSize = files.reduce((acc, f) => acc + (f.sizeNum || 0), 0);
+  // Mock cap of 500MB for visual
+  const percentage = Math.min((totalSize / (500 * 1024 * 1024)) * 100, 100); 
+
+  return (
+    <div className="bg-[#1c1c1e] p-6 rounded-3xl border border-white/5 mb-6">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h3 className="text-gray-400 text-xs font-bold uppercase tracking-widest">Cloud Storage</h3>
+          <div className="text-2xl font-bold text-white mt-1">{formatBytes(totalSize)} <span className="text-gray-500 text-sm font-normal">/ 500 MB</span></div>
+        </div>
+        <div className="w-12 h-12 bg-indigo-500/20 rounded-full flex items-center justify-center text-indigo-400">
+          <PieChart size={24} />
+        </div>
+      </div>
+      <div className="w-full h-3 bg-gray-800 rounded-full overflow-hidden">
+        <div 
+          className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full transition-all duration-1000"
+          style={{ width: `${Math.max(percentage, 2)}%` }}
+        />
+      </div>
+      <div className="flex justify-between mt-3 text-xs text-gray-500 font-medium">
+        <span>{files.length} Files</span>
+        <span>{percentage.toFixed(1)}% Used</span>
+      </div>
+    </div>
+  );
+};
+
+const ActionSheet = ({ file, isOpen, onClose, onAction, isProcessing, progress }) => {
+  if (!isOpen || !file) return null;
+  
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-md transition-opacity" onClick={onClose} />
+      <div className="relative w-full max-w-md bg-[#1c1c1e] rounded-t-[2.5rem] sm:rounded-[2.5rem] p-6 pb-10 sm:p-8 shadow-2xl border-t border-white/10 animate-slide-up">
+        
+        {/* Handle */}
+        <div className="w-12 h-1 bg-white/20 rounded-full mx-auto mb-8" />
+
+        {/* File Header */}
+        <div className="flex items-center gap-5 mb-8">
+           <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-indigo-500/20 to-purple-500/20 flex items-center justify-center border border-white/5 shadow-lg shadow-indigo-500/10">
+             {file.mimeType.includes('image') ? <ImageIcon size={32} className="text-indigo-400"/> :
+              file.mimeType.includes('video') ? <Video size={32} className="text-purple-400"/> :
+              file.mimeType.includes('pdf') ? <FileText size={32} className="text-red-400"/> :
+              <File size={32} className="text-gray-400"/>}
+           </div>
+           <div className="flex-1 min-w-0">
+             <h3 className="text-xl font-bold text-white truncate">{file.name}</h3>
+             <p className="text-sm text-gray-400 mt-1 font-medium">{formatBytes(file.sizeNum)}</p>
+           </div>
+        </div>
+
+        {/* Actions Grid */}
+        <div className="grid grid-cols-4 gap-4">
+           {[
+             { id: 'download', icon: Download, label: 'Open', color: 'text-white', bg: 'bg-indigo-600' },
+             { id: 'star', icon: Star, label: file.starred ? 'Unstar' : 'Star', color: file.starred ? 'text-yellow-400' : 'text-gray-300', bg: 'bg-white/5' },
+             { id: 'share', icon: Share2, label: 'Share', color: 'text-gray-300', bg: 'bg-white/5' },
+             { id: 'delete', icon: Trash2, label: 'Delete', color: 'text-red-400', bg: 'bg-red-500/10' },
+           ].map(action => (
+             <button
+                key={action.id}
+                onClick={() => onAction(action.id, file)}
+                className="flex flex-col items-center gap-3 group"
+             >
+                <div className={`w-16 h-16 rounded-3xl flex items-center justify-center ${action.bg} transition-transform active:scale-90 shadow-lg`}>
+                   <action.icon size={24} className={action.color} />
+                </div>
+                <span className="text-xs font-semibold text-gray-400">{action.label}</span>
+             </button>
+           ))}
+        </div>
+
+        {/* Cancel Button */}
+        <button onClick={onClose} className="w-full mt-8 py-4 rounded-2xl bg-[#2c2c2e] text-white font-semibold active:bg-[#3a3a3c] transition-colors">
+            Cancel
+        </button>
+
+        {/* Processing Overlay */}
+        {isProcessing && (
+           <div className="absolute inset-0 bg-[#1c1c1e]/90 backdrop-blur-sm z-50 flex flex-col items-center justify-center rounded-t-[2.5rem]">
+              <div className="relative w-20 h-20 mb-6">
+                 <svg className="w-full h-full rotate-[-90deg]" viewBox="0 0 36 36">
+                    <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#333" strokeWidth="4" />
+                    <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="#6366f1" strokeWidth="4" strokeDasharray={`${progress}, 100`} />
+                 </svg>
+                 <div className="absolute inset-0 flex items-center justify-center font-bold text-white">{Math.round(progress)}%</div>
+              </div>
+              <h3 className="text-lg font-bold text-white">Opening File...</h3>
+              <p className="text-gray-400 text-sm mt-2">Reassembling chunks for native app</p>
+           </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [viewMode, setViewMode] = useState('grid');
+  const [uploads, setUploads] = useState([]); // { id, name, progress, status, totalChunks, currentChunk, fileData }
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processProgress, setProcessProgress] = useState(0);
+  const [toast, setToast] = useState(null);
+  const [pendingResumes, setPendingResumes] = useState([]);
+
+  // Warn on close if uploading
+  useEffect(() => {
+    const handleBeforeUnload = (e) => {
+      if (uploads.some(u => u.status === 'uploading')) {
+        e.preventDefault();
+        e.returnValue = ''; // Chrome requires this
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [uploads]);
+
+  // Auth & Initial Data
+  useEffect(() => {
+    const init = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    init();
+
+    return onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      if (u) {
+        // Check for resumable uploads in IDB
+        const savedUploads = await IDB.getAll();
+        if (savedUploads.length > 0) {
+           setPendingResumes(savedUploads);
+           showToast(`Found ${savedUploads.length} interrupted upload(s).`, 'info');
+        }
+      } else {
+        setLoading(false);
+      }
+    });
+  }, []);
+
+  // Fetch Files
+  useEffect(() => {
+    if (!user) return;
+    const q = query(collection(db, 'artifacts', appId, 'users', user.uid, 'files'), orderBy('createdAt', 'desc'));
+    return onSnapshot(q, (snap) => {
+      setFiles(snap.docs.map(d => ({ id: d.id, ...d.data(), sizeNum: d.data().size })));
+      setLoading(false);
+    });
+  }, [user]);
+
+  const showToast = (msg, type = 'neutral') => {
+    setToast({ message: msg, type, id: Date.now() });
+  };
+
+  // --- Complex Upload Logic (Resumable) ---
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file || !user) return;
+    e.target.value = ''; // Reset input
+
+    // 1. Read File to Base64
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+        const base64 = evt.target.result.split(',')[1];
+        const uploadId = Date.now().toString();
+        const totalChunks = Math.ceil(base64.length / CHUNK_SIZE);
+        
+        // 2. Prepare State & IDB
+        const uploadTask = {
+            id: uploadId,
+            name: file.name,
+            size: file.size,
+            mimeType: file.type,
+            base64, // Keep in memory for speed, IDB for backup
+            totalChunks,
+            currentChunk: 0,
+            status: 'uploading',
+            progress: 0,
+            fileDocId: null
+        };
+
+        // 3. Save to IDB immediately (Persistence)
+        await IDB.save(uploadTask);
+
+        setUploads(prev => [uploadTask, ...prev]);
+        processUploadQueue(uploadTask);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const processUploadQueue = async (task) => {
+    try {
+        let fileDocId = task.fileDocId;
+
+        // If starting fresh, create metadata doc
+        if (!fileDocId) {
+            const docRef = await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'files'), {
+                name: task.name,
+                size: task.size,
+                mimeType: task.mimeType,
+                createdAt: serverTimestamp(),
+                starred: false,
+                status: 'uploading',
+                chunksUploaded: 0,
+                totalChunks: task.totalChunks
+            });
+            fileDocId = docRef.id;
+            // Update IDB with docRef
+            task.fileDocId = fileDocId;
+            await IDB.save(task);
+        }
+
+        // Upload Chunks Loop
+        for (let i = task.currentChunk; i < task.totalChunks; i++) {
+            // Check if user cancelled (removed from state)
+            // In a real app we'd use a ref to check validity, simplified here
+            
+            const chunkData = task.base64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+            
+            // Upload chunk
+            await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'files', fileDocId, 'chunks'), {
+                index: i,
+                data: chunkData
+            });
+
+            // Update Progress locally
+            const progress = Math.round(((i + 1) / task.totalChunks) * 100);
+            
+            // Update IDB State (Checkpoint)
+            task.currentChunk = i + 1;
+            task.progress = progress;
+            await IDB.save(task);
+
+            setUploads(prev => prev.map(u => u.id === task.id ? { ...u, progress } : u));
+        }
+
+        // Finalize
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'files', fileDocId), {
+            status: 'complete'
+        });
+        await IDB.delete(task.id); // Clear from cache
+        
+        setUploads(prev => prev.filter(u => u.id !== task.id));
+        showToast(`${task.name} uploaded successfully!`, 'success');
+
+    } catch (err) {
+        console.error(err);
+        setUploads(prev => prev.map(u => u.id === task.id ? { ...u, status: 'error' } : u));
+        showToast(`Upload failed: ${task.name}`, 'error');
+    }
+  };
+
+  const resumeUpload = (savedTask) => {
+      setUploads(prev => [savedTask, ...prev]);
+      setPendingResumes(prev => prev.filter(p => p.id !== savedTask.id));
+      processUploadQueue(savedTask);
+  };
+
+  // --- Open / Download Logic ---
+  const handleAction = async (action, file) => {
+      if (action === 'delete') {
+          if (confirm('Delete this file permanently?')) {
+              await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'files', file.id));
+              setSelectedFile(null);
+              showToast('File deleted', 'error');
+          }
+          return;
+      }
+      if (action === 'star') {
+          await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'files', file.id), { starred: !file.starred });
+          setSelectedFile(null); // Keep close for snapiness
+          return;
+      }
+      if (action === 'download') {
+          setIsProcessing(true);
+          setProcessProgress(0);
+          try {
+              // Fetch all chunks
+              const q = query(collection(db, 'artifacts', appId, 'users', user.uid, 'files', file.id, 'chunks'), orderBy('index'));
+              const snap = await getDocs(q);
+              
+              let fullBase64 = '';
+              let count = 0;
+              const total = snap.size;
+
+              snap.forEach(d => {
+                  fullBase64 += d.data().data;
+                  count++;
+                  setProcessProgress((count / total) * 100);
+              });
+
+              // Convert to Blob
+              const byteChars = atob(fullBase64);
+              const byteNumbers = new Array(byteChars.length);
+              for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
+              const byteArray = new Uint8Array(byteNumbers);
+              const blob = new Blob([byteArray], { type: file.mimeType });
+
+              // TRIGGER NATIVE OPEN
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = file.name;
+              a.target = "_blank"; // Important for some browsers
+              a.rel = "noopener noreferrer";
+              document.body.appendChild(a);
+              a.click();
+              
+              setTimeout(() => {
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                  setIsProcessing(false);
+                  setSelectedFile(null);
+              }, 1000);
+
+          } catch (e) {
+              console.error(e);
+              showToast('Error opening file', 'error');
+              setIsProcessing(false);
+          }
+      }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#000000] text-gray-100 font-sans pb-20 selection:bg-indigo-500/30">
+      
+      {/* Navbar */}
+      <nav className="sticky top-0 z-40 bg-[#000000]/80 backdrop-blur-xl border-b border-white/5 px-4 pt-12 pb-4">
+        <div className="flex justify-between items-center max-w-5xl mx-auto">
+            <div>
+                <h1 className="text-2xl font-bold bg-gradient-to-r from-white to-gray-500 bg-clip-text text-transparent">VaultStream</h1>
+                <p className="text-[10px] font-bold text-indigo-500 tracking-[0.2em] uppercase mt-1">Ultimate Edition</p>
+            </div>
+            <div className="flex gap-3">
+                <button onClick={() => setViewMode(m => m === 'grid' ? 'list' : 'grid')} className="w-10 h-10 rounded-xl bg-[#1c1c1e] flex items-center justify-center border border-white/10 text-gray-400">
+                    {viewMode === 'grid' ? <List size={20}/> : <Grid size={20}/>}
+                </button>
+                <label className="h-10 px-5 rounded-xl bg-white text-black font-bold flex items-center gap-2 cursor-pointer active:scale-95 transition-transform shadow-lg shadow-white/10">
+                    <Plus size={18} strokeWidth={3} />
+                    <span>Upload</span>
+                    <input type="file" onChange={handleFileUpload} className="hidden" />
+                </label>
+            </div>
+        </div>
+      </nav>
+
+      <main className="max-w-5xl mx-auto px-4 py-8">
+        
+        {/* Pending Resume Card */}
+        {pendingResumes.length > 0 && (
+            <div className="mb-6 bg-orange-500/10 border border-orange-500/30 p-4 rounded-2xl flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                    <WifiOff className="text-orange-500" />
+                    <div>
+                        <h4 className="font-bold text-orange-200">Interrupted Uploads Found</h4>
+                        <p className="text-xs text-orange-200/60">{pendingResumes.length} file(s) saved locally.</p>
+                    </div>
+                </div>
+                <button 
+                    onClick={() => resumeUpload(pendingResumes[0])}
+                    className="px-4 py-2 bg-orange-500 text-white font-bold rounded-lg text-xs hover:bg-orange-600 transition-colors"
+                >
+                    Resume {pendingResumes[0].name}
+                </button>
+            </div>
+        )}
+
+        {/* Active Uploads */}
+        {uploads.length > 0 && (
+            <div className="space-y-3 mb-8">
+                {uploads.map(u => (
+                    <div key={u.id} className="bg-[#1c1c1e] p-4 rounded-2xl border border-white/10 relative overflow-hidden">
+                        <div className="flex justify-between mb-2 relative z-10">
+                            <span className="font-medium text-sm truncate max-w-[70%]">{u.name}</span>
+                            <span className="text-xs font-mono text-indigo-400">{u.progress}%</span>
+                        </div>
+                        <div className="w-full bg-gray-800 h-1.5 rounded-full overflow-hidden relative z-10">
+                            <div className="h-full bg-indigo-500 transition-all duration-300" style={{width: `${u.progress}%`}} />
+                        </div>
+                        {u.status === 'error' && <span className="text-xs text-red-400 mt-2 block">Upload Failed</span>}
+                        {/* Subtle background glow */}
+                        <div className="absolute inset-0 bg-indigo-500/5" />
+                    </div>
+                ))}
+            </div>
+        )}
+
+        {/* Storage Chart */}
+        {!loading && files.length > 0 && <StorageChart files={files} />}
+
+        {/* Search */}
+        <div className="relative mb-8 group">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 group-focus-within:text-white transition-colors" size={20} />
+            <input 
+                placeholder="Search your vault..." 
+                className="w-full bg-[#1c1c1e] border border-white/5 rounded-2xl py-4 pl-12 pr-4 text-white focus:outline-none focus:ring-1 focus:ring-indigo-500 transition-all placeholder:text-gray-600"
+            />
+        </div>
+
+        {/* File Grid */}
+        {loading ? (
+            <div className="flex flex-col items-center py-20 text-gray-500 gap-4">
+                <Loader2 className="animate-spin text-indigo-500" size={32} />
+                <p>Decrypting Vault...</p>
+            </div>
+        ) : files.length === 0 ? (
+            <div className="text-center py-20 opacity-50">
+                <Cloud size={64} className="mx-auto mb-4 text-gray-600"/>
+                <p>Vault is empty.</p>
+            </div>
+        ) : (
+            <div className={`grid gap-4 ${viewMode === 'grid' ? 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4' : 'grid-cols-1'}`}>
+                {files.map(file => (
+                    <div 
+                        key={file.id}
+                        onClick={() => setSelectedFile(file)}
+                        className={`
+                            group relative cursor-pointer bg-[#1c1c1e] rounded-3xl p-4 border border-white/5 
+                            hover:border-indigo-500/30 transition-all duration-300 active:scale-95
+                            ${viewMode === 'list' ? 'flex items-center gap-4' : 'flex flex-col'}
+                        `}
+                    >
+                        {/* Thumbnail */}
+                        <div className={`
+                            ${viewMode === 'list' ? 'w-14 h-14' : 'h-36 mb-4'} 
+                            rounded-2xl flex items-center justify-center relative overflow-hidden
+                            bg-gradient-to-tr from-white/5 to-transparent
+                        `}>
+                            {/* Icon */}
+                            <div className="relative z-10">
+                                {file.mimeType.includes('image') ? <ImageIcon className="text-indigo-400" size={viewMode === 'list'?24:40}/> :
+                                 file.mimeType.includes('video') ? <Video className="text-purple-400" size={viewMode === 'list'?24:40}/> :
+                                 file.mimeType.includes('pdf') ? <FileText className="text-red-400" size={viewMode === 'list'?24:40}/> :
+                                 <File className="text-gray-400" size={viewMode === 'list'?24:40}/>}
+                            </div>
+                            
+                            {/* Star */}
+                            {file.starred && <Star size={14} className="absolute top-3 left-3 text-yellow-500 fill-yellow-500 z-20"/>}
+                        </div>
+
+                        {/* Details */}
+                        <div className="flex-1 min-w-0">
+                            <h3 className="font-semibold text-gray-200 text-sm truncate mb-1">{file.name}</h3>
+                            <div className="flex items-center gap-2 text-[10px] text-gray-500 font-medium uppercase tracking-wider">
+                                <span>{file.mimeType.split('/')[1] || 'FILE'}</span>
+                                <span className="w-1 h-1 rounded-full bg-gray-600" />
+                                <span>{formatBytes(file.sizeNum)}</span>
+                            </div>
+                        </div>
+
+                        {/* Hover Actions */}
+                        <button className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity p-2 bg-white/10 rounded-full backdrop-blur-md">
+                            <MoreHorizontal size={16} className="text-white" />
+                        </button>
+                    </div>
+                ))}
+            </div>
+        )}
+      </main>
+
+      {/* Overlays */}
+      <ActionSheet 
+        file={selectedFile} 
+        isOpen={!!selectedFile} 
+        onClose={() => !isProcessing && setSelectedFile(null)} 
+        onAction={handleAction}
+        isProcessing={isProcessing}
+        progress={processProgress}
+      />
+
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+
+      <style jsx global>{`
+        @keyframes slide-up {
+          from { transform: translateY(100%); }
+          to { transform: translateY(0); }
+        }
+        .animate-slide-up { animation: slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        @keyframes slide-down {
+            from { transform: translate(-50%, -100%); opacity: 0; }
+            to { transform: translate(-50%, 0); opacity: 1; }
+        }
+        .animate-slide-down { animation: slide-down 0.3s ease-out forwards; }
+      `}</style>
+    </div>
+  );
+}
+
+
